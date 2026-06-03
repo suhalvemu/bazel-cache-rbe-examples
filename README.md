@@ -79,6 +79,7 @@ bazel build //... --config=buildbuddy-cache
 | `docs/rbe.md` | RBE vs caching, when to use each |
 | `docs/monorepo-patterns.md` | Dep graph, shared libs, macros, proto, cross-compile |
 | `docs/query-examples.md` | `query`, `cquery`, `aquery` command reference |
+| `docs/cache-terminology.md` | CAS, Action Cache, BES, cache hit rate, throughput, volume — full glossary |
 
 ---
 
