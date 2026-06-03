@@ -1,252 +1,379 @@
-# Bazel Cache Terminology
-
-A reference for every term you'll encounter when working with Bazel caching and RBE — what it means, how it works, and why it matters.
+# Bazel Cache Terminology — With Examples
 
 ---
 
-## The Two Cache Stores
+## CAS — Content Addressable Store
 
-### CAS — Content Addressable Store
+The storage layer that holds **actual file bytes**, looked up by the SHA-256 hash of their contents.
 
-The storage layer that holds **file contents**.
-
-Every file is stored and retrieved by the **SHA-256 hash of its contents**, not by its name or path. Two targets that produce identical outputs share the same CAS entry — no duplication.
+### How it works
 
 ```
-file: greeter.o (12 KB)
-sha256: a3f8c2...  ←── this is the key
-
-CAS[a3f8c2...] = <binary contents of greeter.o>
+You write:     greeter.cc  (source file, 312 bytes)
+Bazel hashes:  SHA-256("Hello from C++, Bazel!...") = a3f8c2d1...
+Stores:        CAS["a3f8c2d1..."] = <312 bytes of greeter.cc>
 ```
 
-- **"Content addressable"** means: the address (key) IS the content (hash). If the hash matches, the content is guaranteed to be identical.
-- Bazel uses CAS to store both **inputs** (source files, toolchains) and **outputs** (compiled objects, binaries, test logs).
-- In BuildBuddy, the CAS is the backend storage — when you see "Download 1.4 MiB", that's Bazel fetching an output from the CAS.
+When another machine needs the same file, Bazel asks the CAS: *"give me the file with hash a3f8c2d1."* No name. No path. Just the hash.
 
-### Action Cache (AC)
+### Why "content addressable" matters
 
-The index that maps **"what I want to build" → "what the result was"**.
-
-An action cache entry answers: *"Given these exact inputs and this exact command, what was the output?"*
+Two targets produce identical compiled output → they share one CAS entry:
 
 ```
-Action Cache key:
-  input hashes:  [greeter.cc → a3f8c2, version.h → d91be4]
-  command hash:  [clang -O2 -c greeter.cc → 88fa12]
-  ─────────────────────────────────────────────────────
-  → output digest: { greeter.o → b7c3a1 }
+apps/c-lib/greet.o    (compiled with clang -O2)  →  hash: b7c3a1...
+apps/cpp-lib/greet.o  (same flags, same content)  →  hash: b7c3a1...  ← SAME ENTRY
 ```
 
-When Bazel checks the cache:
-1. It computes the action key from all declared inputs + the command
-2. It looks up that key in the Action Cache
-3. If found (cache hit): it fetches the output from the CAS by its digest
-4. If not found (cache miss): it runs the action locally, then stores both the AC entry and the CAS blobs
+The CAS stores one copy, both targets read it. This is why large monorepos don't blow up in storage costs.
 
-**AC and CAS work together** — AC holds the mapping, CAS holds the actual files. Neither is useful without the other.
+### What gets stored in CAS
+
+```
+Inputs:   greeter.cc, version.h, clang binary, stdlib headers
+Outputs:  greeter.o, greeter_test (binary), test.log
+```
+
+Every file that flows through a Bazel action — source or output — is a CAS blob.
 
 ---
 
-## Cache Hit and Miss
+## Action Cache (AC)
 
-### Cache Hit
+The **index** that maps *"I want to build X with these inputs"* → *"the result is this CAS digest"*.
 
-An action whose result was found in the Action Cache. Bazel skips execution entirely and downloads the output from CAS.
-
-```
-[cached] CppCompile apps/cpp-lib/greeter.o   ← cache hit, ~50ms download
-[local]  CppLink apps/cpp-lib/greeter_test    ← cache miss, ~2s local execution
-```
-
-A **remote cache hit** means the result came from the shared remote cache (BuildBuddy, bazel-remote, GCS). A **local cache hit** means it came from `~/.cache/bazel-disk-cache` on your machine.
-
-### Cache Miss
-
-An action with no matching entry in the Action Cache. Bazel runs it locally (or on a remote worker if using RBE), then stores the result so future builds can hit it.
-
-Cache misses happen when:
-- First time a target is ever built
-- Any input file changed (source, header, toolchain, flag)
-- The action command changed (compiler flag, env var declared in the action)
-
-### Cache Hit Rate
-
-The percentage of actions served from cache in a given build.
+### The lookup key
 
 ```
-Cache Hit Rate = (remote cache hits) / (total actions) × 100
+Action Cache Key = hash of:
+  ├── all input file hashes   (greeter.cc → a3f8c2, version.h → d91be4, clang → 88fa12)
+  ├── the command             (clang++ -O2 -std=c++17 -c greeter.cc -o greeter.o)
+  └── environment variables   (declared ones only — hermeticity enforced here)
+
+Result → SHA-256 of all the above = 4d9fe7...
 ```
 
-| Rate | What it means |
-|------|--------------|
-| 0% | Cold build — nothing cached yet |
-| 50-70% | Partial hit — some deps changed or cache is warming up |
-| 80-95% | Healthy production cache |
-| 95%+ | Excellent — almost nothing rebuilt |
+### A full cache lookup in slow motion
 
-Target: **80%+ in CI**. Below this usually means non-hermetic builds or missing `--remote_upload_local_results=true`.
+**Step 1 — Bazel computes the action key**
+```
+inputs:  { greeter.cc: a3f8c2, version.h: d91be4 }
+command: clang++ -O2 -c greeter.cc
+key:     4d9fe7...
+```
+
+**Step 2 — Bazel queries the Action Cache**
+```
+AC.get("4d9fe7...") → { greeter.o: b7c3a1, size: 14336 }
+                                    ↑
+                              CAS digest of the output
+```
+
+**Step 3a — Cache HIT → fetch from CAS**
+```
+CAS.get("b7c3a1...") → <14336 bytes of greeter.o>
+Written to: bazel-out/.../greeter.o
+Time: ~80ms download  (vs 2.4s local compile)
+```
+
+**Step 3b — Cache MISS → run locally, then store**
+```
+Run: clang++ -O2 -c greeter.cc → produces greeter.o (hash: b7c3a1)
+AC.put("4d9fe7...", { greeter.o: "b7c3a1" })   ← write AC entry
+CAS.put("b7c3a1...", <greeter.o bytes>)         ← write CAS blob
+Next build: cache hit guaranteed (until any input changes)
+```
+
+### AC and CAS together
+
+```
+Action Cache                        CAS
+───────────────────────────         ──────────────────────────
+4d9fe7... → { greeter.o: b7c3a1 }  b7c3a1... → <greeter.o bytes>
+8a21cd... → { greeter_test: f4e2b9 }  f4e2b9... → <greeter_test bytes>
+```
+
+AC is the **map**. CAS is the **storage**. Neither works without the other.
 
 ---
 
-## Transfer Metrics
+## Cache Hit
 
-### Download Throughput
+An action whose result was already in the Action Cache. Bazel skips compilation entirely.
 
-The rate at which Bazel fetches cached outputs from the remote cache.
-
-```
-Download throughput: 45 MB/s
-```
-
-Higher is better. Bottlenecks are usually:
-- Network bandwidth between the build machine and cache server
-- Cache server disk I/O
-- Number of concurrent downloads (`--remote_download_outputs`)
-
-### Upload Throughput
-
-The rate at which Bazel writes new action outputs to the remote cache after a cache miss.
+### What you see in terminal output
 
 ```
-Upload throughput: 12 MB/s
+[5 / 10] GoStdlib external/rules_go+/stdlib_/pkg; 1s remote-cache    ← HIT
+[6 / 10] CppCompile apps/cpp-lib/greeter.o; 2s darwin-sandbox        ← MISS (ran locally)
+[8 / 10] GoLink apps/go-service/go-service_/go-service; Downloading 1.4 MiB / 1.4 MiB; 1s remote-cache  ← HIT
 ```
 
-Upload only happens when `--remote_upload_local_results=true` is set. Without it, local builds never populate the shared cache.
-
-### Cache Volume
-
-Total data transferred in a build — uploads + downloads combined.
+### What you see in the build summary
 
 ```
-Downloaded: 48 MB   (cache hits — outputs fetched)
-Uploaded:   220 MB  (cache misses — outputs stored)
+INFO: 10 processes: 4 remote cache hit, 6 internal.
+                    ↑
+         4 actions skipped — outputs fetched from BuildBuddy
 ```
 
-High upload volume = many cache misses = cold or invalidated cache.
-High download volume = many cache hits = healthy warm cache.
+### Cold vs warm build on this repo
+
+```
+Build 1 (nothing cached):
+  10 processes: 6 internal, 4 darwin-sandbox
+  Elapsed: 22.4s
+
+Build 2 (after bazel clean, warm cache):
+  10 processes: 4 remote cache hit, 6 internal
+  Elapsed: 4.7s    ← 79% faster, zero compilation
+```
 
 ---
 
-## Action Graph Concepts
+## Cache Miss
 
-### Action
+An action with no matching AC entry. Bazel runs it locally, then populates the cache for everyone else.
 
-A single unit of work Bazel can cache: compile a file, link a binary, run a test, execute a genrule.
+### When does a cache miss happen?
 
-Every action has:
-- **Inputs** — declared files the action reads (srcs, hdrs, deps)
-- **Command** — the exact executable + flags
-- **Outputs** — files the action produces
+| Cause | Example |
+|-------|---------|
+| First ever build | Never built before on any machine |
+| Source file changed | Edit one line in `greeter.cc` |
+| Header changed | Add a field to `version.h` |
+| Compiler flag changed | Add `-DDEBUG` to a build |
+| Toolchain updated | Go SDK upgraded from 1.22 → 1.23 |
+| Bazel version changed | Upgrade from 8.1 → 8.2 |
 
-Hermeticity requires that ALL inputs are declared. An undeclared input = non-hermetic action = cache key may not reflect actual inputs.
-
-### Action Key / Cache Key
-
-The SHA-256 hash of all action inputs + the command. This is what Bazel looks up in the Action Cache.
-
-Change any input (even a whitespace change in a header) → different hash → cache miss.
-
-### Critical Path
-
-The longest chain of sequential actions in the build graph. The build cannot complete faster than the critical path, regardless of how many workers you add.
+### Cache miss is surgical — only affected targets rebuild
 
 ```
-greeter.cc → greeter.o → greeter_test (linked) → greeter_test (run)
-     2s           1s             3s                    1s
-                              ↑
-                        critical path = 7s
+Change:  libs/common/version.cc
+
+Rebuilds:
+  libs/common:version           ← changed
+  apps/cpp-lib:greeter          ← depends on version
+  apps/cpp-lib:greeter_test     ← depends on greeter
+
+Cache hits (unchanged):
+  apps/go-service:go-service    ← no dependency on version.cc
+  apps/python-lib:python-lib    ← no dependency on version.cc
+  apps/java-app:greeter-app     ← no dependency on version.cc
 ```
 
-BuildBuddy's Timing tab highlights the critical path. Optimising it (e.g. via RBE parallelism) is how you reduce total build time.
-
-### Memoisation
-
-The theoretical model behind caching: *"if this function (action) was called with these exact arguments (inputs) before, return the stored result."* Bazel's action cache is a distributed memoisation layer over your build.
+This is the core value of Bazel's dependency graph — it rebuilds the minimum possible set.
 
 ---
 
-## Remote Execution Concepts
+## Cache Hit Rate
 
-### CAS Digest
-
-A `(hash, size)` pair that uniquely identifies a CAS entry.
+The percentage of build actions served from cache in one invocation.
 
 ```
-Digest {
-  hash: "a3f8c2d1..."   # SHA-256 of file contents
-  size: 12288           # size in bytes
-}
+Cache Hit Rate = (remote cache hits ÷ total actions) × 100
 ```
 
-The Remote Execution API uses digests everywhere — to refer to input files, output files, and action definitions.
+### Real numbers from this repo
 
-### Input Root
+```
+Cold build (first run):    3 / 112 actions =  2.6%   ← normal for first build
+Warm build (second run): 109 / 112 actions = 97.3%   ← healthy production cache
+```
 
-The complete set of input files an action needs, assembled by Bazel and uploaded to CAS before the action runs on a remote worker.
+### What each range means
 
-In RBE, Bazel:
-1. Computes the input root (all declared inputs)
-2. Uploads any missing CAS blobs
-3. Sends the action to the remote worker
-4. Worker reconstructs the input root from CAS
-5. Runs the action
-6. Uploads outputs to CAS
-7. Records the result in the Action Cache
+| Rate | Meaning | Action |
+|------|---------|--------|
+| 0–10% | Cold cache or first build | Normal, will improve |
+| 30–60% | Cache warming up, or many changes | Wait a few builds |
+| 70–85% | Healthy team cache | Good |
+| 85–95% | Excellent | Production-ready |
+| 95%+ | Near-perfect | Elite — hermetic + shared cache |
+| <50% consistently | Problem: non-hermetic builds, missing uploads, or too many changes | Investigate |
 
-### Executor / Worker
+### The most common reason for low hit rate
 
-A machine that runs build actions in RBE. Multiple workers run actions in parallel, providing the speed-up that pure caching can't give (caching only helps on repeated builds; RBE helps on the first build too).
+```
+# Missing this flag:
+--remote_upload_local_results=true
+
+Without it: local builds read from cache but never write to it.
+Developers get cache hits from CI, but CI never gets cache hits from developers.
+→ hit rate stays low for everyone.
+```
 
 ---
 
-## BuildBuddy-Specific Terms
+## Download Throughput
 
-### Invocation
+How fast Bazel pulls cached outputs from the remote cache.
 
-A single `bazel build` or `bazel test` run. BuildBuddy records every invocation as a separate entry in the UI, identified by a UUID (e.g. `208d8e9f-cb64-4282-8390-53e6d5f89805`).
+```
+Build output:
+  Downloading apps/go-service/go-service_/go-service, 1.4 MiB / 1.4 MiB; 1s remote-cache
+  ↑ Downloaded 1.4 MB in 1s = 1.4 MB/s download throughput
+```
 
-Each invocation shows: targets built, cache hit rate, timing waterfall, test results, and BES event stream.
+### What affects download throughput
 
-### BES — Build Event Service / Build Event Stream
+```
+Machine ←─── network ───→ BuildBuddy / bazel-remote
+ │                               │
+ │ bandwidth limit               │ disk I/O / CPU
+ │ (common bottleneck on CI)     │ (rare bottleneck with managed SaaS)
+```
 
-The gRPC protocol Bazel uses to stream structured build events (target started, action finished, test result, build complete) to an external service like BuildBuddy.
+**Typical values:**
+- Developer laptop on office WiFi: 5–20 MB/s
+- CI runner (GitHub Actions): 20–100 MB/s
+- Same datacenter as cache: 200–1000 MB/s (RBE benefit)
 
-Configured via:
-```ini
+Low throughput = cache hits still take time → consider BuildBuddy RBE where workers are co-located with the cache.
+
+---
+
+## Upload Throughput
+
+How fast Bazel writes new build outputs to the remote cache after a cache miss.
+
+```
+After a cache miss, Bazel stores the result:
+  Uploading apps/cpp-lib/greeter.o (14 KB)    →  0.1s
+  Uploading apps/cpp-lib/greeter_test (2.1 MB) →  0.8s
+```
+
+Upload only happens when `--remote_upload_local_results=true` is set. This flag makes your local build a **cache contributor**, not just a cache consumer.
+
+```
+Without flag:  you benefit from others' builds, contribute nothing
+With flag:     you contribute, CI benefits, team benefits
+```
+
+---
+
+## Cache Volume
+
+Total bytes transferred during one build — uploads + downloads combined.
+
+```
+BuildBuddy invocation summary:
+  Downloaded:  48 MB   (cache hits — 109 outputs fetched)
+  Uploaded:   220 MB   (cache misses — 3 new outputs stored)
+```
+
+### Reading volume as a signal
+
+| Pattern | What it tells you |
+|---------|-----------------|
+| High download, low upload | Warm cache, mostly hits — healthy |
+| High upload, low download | Cold cache or many changes — normal after changes |
+| High upload + low hit rate | Hermetic problem — same work being re-uploaded repeatedly |
+| Both near zero | Local-only build (BES connected but no remote cache) |
+
+---
+
+## BES — Build Event Service
+
+The gRPC stream Bazel opens **alongside** the build to send structured events to BuildBuddy's UI.
+
+### What events flow over BES
+
+```
+Build started     → creates the invocation record in UI
+Target configured → "building //apps/cpp-lib:greeter"
+Action finished   → "compiled greeter.cc in 2.1s, cache miss"
+Test result       → "greeter_test PASSED in 0.7s (shard 1/2)"
+Build complete    → final summary: 112 actions, 109 cache hits, 4.7s
+```
+
+### BES vs remote cache — two separate things
+
+```
+--remote_cache=grpcs://remote.buildbuddy.io
+    ↑ stores/fetches build artifacts (outputs)
+    ↑ caching works without BES
+
 --bes_backend=grpcs://remote.buildbuddy.io
---bes_results_url=https://app.buildbuddy.io/invocation/
+    ↑ streams build events to the UI
+    ↑ UI works without affecting caching
 ```
 
-**BES is separate from caching.** You can have caching without BES (no UI), or BES without caching (UI shows build events but no cache hits). For the full BuildBuddy experience, you need both.
+You can have caching without BES (fast builds, no UI). You can have BES without caching (UI shows events, but every build is a cache miss). For full value, you want both — which is why both flags are in `.bazelrc`.
 
-### Remote Header
+### The invocation URL
 
-An HTTP/gRPC header Bazel attaches to every request to the remote cache or BES backend. Used for authentication:
+Every build with BES prints:
+```
+INFO: Streaming build results to: https://app.buildbuddy.io/invocation/208d8e9f-...
+```
+
+Open it while the build is running — the UI updates live as events stream in.
+
+---
+
+## Remote Header
+
+An HTTP/gRPC metadata header Bazel attaches to every request to the cache or BES backend. Used for authentication and routing.
 
 ```ini
---remote_header=x-buildbuddy-api-key=YOUR_KEY
+# user.bazelrc (never commit this)
+build --remote_header=x-buildbuddy-api-key=efAkJg6Z...
 ```
 
-This is how BuildBuddy identifies which account's cache to use and where to post invocation results.
+Every cache read, cache write, and BES event carries this header. BuildBuddy uses it to:
+- Route requests to your account's cache partition
+- Post invocations to your dashboard
+- Enforce usage limits on the free tier
+
+### Why it's in user.bazelrc and not .bazelrc
+
+```
+.bazelrc  (committed to git)   → shared config, no secrets
+user.bazelrc (gitignored)      → personal secrets, local overrides
+
+try-import %workspace%/user.bazelrc   ← loads user.bazelrc if it exists,
+                                         silently skips if it doesn't (e.g. CI)
+```
+
+In CI, the key is injected via `${{ secrets.BUILDBUDDY_API_KEY }}` as an environment variable — the workflow passes it as `--remote_header` directly, never touching a file.
+
+---
+
+## Critical Path
+
+The longest sequential chain of actions in the build graph. The build cannot finish faster than this chain, no matter how many workers you add.
+
+```
+Full build graph:
+
+greeter.cc ──→ greeter.o (2s) ──→ greeter_test_linked (1s) ──→ greeter_test_run (0.7s)
+version.cc ──→ version.o  (1s) ──┘
+greeter.h  ──→ (header only, no compile)
+
+Critical path:  greeter.cc → greeter.o → greeter_test_linked → greeter_test_run
+Duration:       2s + 1s + 0.7s = 3.7s  (minimum possible build time)
+```
+
+Adding 10 more workers doesn't help if the critical path is 3.7s — that's the floor.
+
+**BuildBuddy's Timing tab** highlights the critical path in orange so you know where to focus optimization effort.
 
 ---
 
 ## Quick Reference
 
-| Term | One line |
-|------|----------|
-| **CAS** | Storage keyed by content hash — holds the actual file bytes |
-| **Action Cache** | Index mapping (inputs + command) → output digests |
-| **Cache hit** | Action result found in AC — execution skipped |
-| **Cache miss** | Action result not found — Bazel runs it, then stores result |
-| **Cache hit rate** | % of actions served from cache (target: 80%+) |
-| **Download throughput** | Speed of fetching cached outputs from remote cache |
-| **Upload throughput** | Speed of writing new outputs to remote cache |
-| **Cache volume** | Total bytes transferred (uploads + downloads) |
-| **Action key** | Hash of all inputs + command — the cache lookup key |
-| **Critical path** | Longest sequential chain of actions — determines minimum build time |
-| **Input root** | Complete input file tree assembled before an action runs |
-| **Executor/Worker** | Machine that runs actions in RBE |
-| **Invocation** | One `bazel build/test` run — recorded as a unit in BuildBuddy |
-| **BES** | Protocol that streams build events to BuildBuddy UI |
-| **Remote header** | Auth credential attached to every cache/BES request |
+| Term | What it is | Example value |
+|------|-----------|---------------|
+| **CAS** | Storage for file bytes, keyed by hash | `a3f8c2... → <greeter.o bytes>` |
+| **Action Cache** | Index: inputs+command → output hashes | `4d9fe7... → { greeter.o: b7c3a1 }` |
+| **Cache hit** | Action result found, execution skipped | `4 remote cache hit` in build summary |
+| **Cache miss** | Action result not found, runs locally | `4 darwin-sandbox` in build summary |
+| **Cache hit rate** | % actions from cache | `97.3%` warm, `2.6%` cold |
+| **Download throughput** | Speed fetching cached outputs | `1.4 MB/s` on WiFi, `100 MB/s` CI |
+| **Upload throughput** | Speed storing new outputs | Requires `--remote_upload_local_results=true` |
+| **Cache volume** | Total bytes transferred | `48 MB down, 220 MB up` |
+| **BES** | Event stream → BuildBuddy UI | Separate from caching |
+| **Remote header** | Auth credential per request | `x-buildbuddy-api-key=...` |
+| **Critical path** | Minimum possible build time | Highlighted in BuildBuddy Timing tab |
+| **Invocation** | One `bazel build/test` run | UUID in BuildBuddy dashboard |
