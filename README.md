@@ -1,6 +1,10 @@
 # Bazel Monorepo Reference
 
-A production-grade Bazel monorepo covering every major use case: multi-language builds, remote caching, RBE, Starlark macros, custom rules, cross-compilation, and CI/CD integration.
+> A hands-on reference for engineers adopting Bazel in a polyglot monorepo — built from real-world Engineering Productivity experience.
+
+Most Bazel tutorials stop at "hello world." This repo shows what a production setup actually looks like: 6 languages building in the same graph, shared libraries with enforced visibility, remote caching that cuts CI costs by 40-79%, RBE that scales build parallelism to 50+ concurrent actions, and hermetic toolchains that eliminate "works on my machine."
+
+Everything here compiles, tests pass, and CI is green.
 
 Built on **Bazel 8.2.1** with **bzlmod** (no legacy WORKSPACE).
 
@@ -116,3 +120,15 @@ GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every push and PR:
 - **pnpm** — for TypeScript example bootstrap
 - **gcloud** — for GCS cache example
 - **BuildBuddy account** — free at [app.buildbuddy.io](https://app.buildbuddy.io) for cloud cache/RBE
+
+---
+
+## Author
+
+Built by **Suhal Vemu** — Senior Software Engineer specialising in Bazel, build infrastructure, and Engineering Productivity.
+
+- GitHub: [@suhalvemu](https://github.com/suhalvemu)
+- LinkedIn: [linkedin.com/in/suhalvemu](https://www.linkedin.com/in/suhalvemu)
+- Email: vemusuhal@gmail.com
+
+Questions, issues, or want to discuss Bazel at scale? Open an [issue](https://github.com/suhalvemu/bazel-cache-rbe-examples/issues) or reach out directly — always happy to talk build systems.
