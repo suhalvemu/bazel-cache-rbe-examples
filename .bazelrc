@@ -1,0 +1,37 @@
+# --- Common flags ---
+# bzlmod is the default in Bazel 8+ — no --enable_bzlmod needed
+build --verbose_failures
+build --announce_rc
+
+# Suppress workspace output symlinks (bazel-bin, bazel-out, bazel-testlogs)
+# Prefix "/" causes symlink creation to fail silently — workspace stays clean
+build --symlink_prefix=/
+
+# --- Test flags ---
+test --test_output=errors
+
+# --- Local overrides (gitignored) ---
+# user.bazelrc holds secrets like API keys — never commit it
+try-import %workspace%/user.bazelrc
+
+# --- Cache profiles (import one via --config) ---
+
+# Local disk cache (~/.cache/bazel-disk-cache)
+build:local-cache --disk_cache=~/.cache/bazel-disk-cache
+
+# Buildbuddy remote cache (free tier) — API key goes in user.bazelrc (gitignored)
+build:buildbuddy-cache --remote_cache=grpcs://remote.buildbuddy.io
+build:buildbuddy-cache --remote_upload_local_results=true
+
+# Buildbuddy RBE — set BUILDBUDDY_API_KEY in env
+build:buildbuddy-rbe --config=buildbuddy-cache
+build:buildbuddy-rbe --remote_executor=grpcs://remote.buildbuddy.io
+build:buildbuddy-rbe --jobs=50
+
+# Buildbarn (self-hosted, see rbe/02-buildbarn)
+build:buildbarn --remote_cache=grpc://localhost:8980
+build:buildbarn --remote_executor=grpc://localhost:8980
+
+# GCS remote cache — set GCS_BUCKET in env
+build:gcs --remote_cache=https://storage.googleapis.com/${GCS_BUCKET}
+build:gcs --google_default_credentials
