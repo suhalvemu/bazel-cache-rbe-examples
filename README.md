@@ -80,6 +80,7 @@ bazel build //... --config=buildbuddy-cache
 | `docs/monorepo-patterns.md` | Dep graph, shared libs, macros, proto, cross-compile |
 | `docs/query-examples.md` | `query`, `cquery`, `aquery` command reference |
 | `docs/cache-terminology.md` | CAS, Action Cache, BES, cache hit rate, throughput, volume — full glossary |
+| `docs/faq-cache-and-build-performance.md` | Why cache misses happen, why builds are slow — FAQ with fixes and debug commands |
 
 ---
 
